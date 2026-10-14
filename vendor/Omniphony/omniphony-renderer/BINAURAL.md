@@ -1,0 +1,352 @@
+# Binaural Headphone Output
+
+The renderer has an independent **binaural output stage** for headphones: when
+selected, the whole VBAP / crossover / speaker chain is bypassed and every
+input channel (beds and objects) is rendered straight to 2-channel stereo
+through an HRTF, with interaural time difference (ITD), shoebox early
+reflections and live head tracking.
+
+Per channel, per block:
+
+```
+position → rotate(head pose) → (azimuth, elevation, distance)
+         → air-absorption low-pass (cutoff falls with distance)
+         → per-ear ITD delay → per-ear HRIR convolution   (authored level, no 1/d)
+         → + 6 first-order shoebox reflections (per-ear delay incl. the image's
+             ITD + ILD pan, level relative to the direct: d_source / d_image,
+             low-passed by the wall and by the air over the image path)
+         → + shared late-reverb tail (stereo FDN, send ∝ distance)
+         → mix into [L, R]
+```
+
+The direct path applies **no distance attenuation**: object and bed levels
+are authored by the mixer (Atmos object gain) and are respected as such.
+Distance is carried by the *cues* around the direct sound instead — the
+reflections and the reverb send are expressed relative to it, so their ratio
+to the direct sound falls with distance the way it does in a room, and the
+air absorption dulls far sources.
+
+Measured cost: ~0.09 ms per 40-sample block for a 16-channel Atmos stream
+(~11 % of the realtime budget), reflections included.
+
+One exception: a bed mapped to a **`spatialize: false` speaker** (the LFE)
+keeps its direct-routing intent. Sub-bass carries no usable direction, so the
+channel skips the whole pipeline above and feeds **both ears equally at
+constant power** (−3 dB each), dry and full-range — no HRIR, no ITD, no
+reverb send, and head rotation has no effect on it. Level is unity overall
+(no +10 dB LFE convention), matching the speaker path's untouched one-hot
+routing.
+
+## Enabling it
+
+Set the output mode in `~/.config/omniphony/config.yaml`:
+
+```yaml
+render:
+  binaural:
+    output_mode: binaural      # "speaker" (default) restores the VBAP path
+    unit_scale_m: 1.0
+    hrir_source: saf
+    head_tracking:
+      osc_address: /gamerotationvector
+      format: auto
+```
+
+> **mpv host**: `ad_orender` fixes the channel count when the decoder
+> initialises, so the binaural mode must be **active at boot** (in the config)
+> — toggling it during playback changes the render but not the negotiated
+> channel layout. Restart mpv after switching modes.
+
+Everything below is also live-tunable from the **Binaural / Headphones** panel
+in Studio and over OSC (addresses listed at the end).
+
+## Configuration reference (`render.binaural`)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `output_mode` | `speaker` | `binaural` enables the headphone stage |
+| `unit_scale_m` | `1.0` | metres per ADM unit — isotropic distance scale (the anisotropic `room_ratio` is deliberately not used here) |
+| `head_radius_m` | `0.0875` | effective head radius (half the inter-ear distance) for the Woodworth ITD model; fit it to the listener (clamped 0.05–0.15) |
+| `hrir_source` | `saf` | `saf`/`kemar` (embedded measured KEMAR), `synthetic` (analytic head shadow), `sofa` (personalised set, needs the `sofa` build feature), `brir` (a measured room, see *Room responses* below; same build feature) |
+| `hrtf_sofa_path` | — | SOFA file used when `hrir_source: sofa` |
+| `brir_sofa_path` | — | SOFA room-response file used when `hrir_source: brir` |
+| `brir_head_tracking` | — | keep every measured head orientation of the BRIR resident. Unset: follows `head_tracking.osc_address` (orientations are loaded when it is set, a single one otherwise) |
+| `brir_max_length_s` | `2.0` | longest response kept, seconds (`0` = whole responses) |
+| `brir_tail_floor_db` | `60` | decibels below a response's total energy at which its tail is cut |
+| `head_tracking.osc_address` | — | OSC address carrying the orientation (empty disables tracking) |
+| `head_tracking.format` | `auto` | `auto` / `quat` / `rotvec` / `euler` |
+| `reflections.enabled` | `false` | shoebox early reflections (externalization) |
+| `reflections.room_width_m` | `4.0` | room extent, x (clamped 1–20 m). The three extents are minimums: the room grows to contain the scene (see *Scale* below) |
+| `reflections.room_depth_m` | `5.0` | room extent, y |
+| `reflections.room_height_m` | `2.7` | room extent, z |
+| `reflections.level` | `0.5` | per-reflection wall gain (0–1) |
+| `reflections.wall_cutoff_hz` | `6000` | high-frequency cutoff of the walls (1000–20000; 20000 = none). Each reflection is low-passed here, combined with the air absorption over its own image path |
+| `reverb.enabled` | `false` | late-reverb tail (stereo FDN) |
+| `reverb.level` | `0.25` | reverb return level (0–1) |
+| `reverb.rt60_s` | `0.35` | broadband decay time (s) — living-room-ish, not a hall |
+| `reverb.predelay_ms` | `20` | gap between direct sound and tail start |
+| `reverb.size` | `1.0` | scale on the network's delay lines (0.5–2): smaller is a denser, smaller-sounding room, larger a sparser, bigger one; the decay time stays `rt60_s` |
+| `reverb.rt60_low_ratio` | `1.0` | decay time below ~250 Hz as a ratio of `rt60_s` (0.25–4): above 1 the bass lingers (hard walls), below 1 it dies first |
+| `reverb.rt60_high_ratio` | `1.0` | decay time above ~4 kHz as a ratio of `rt60_s` (0.25–4): below 1 the treble dies first (air, soft furnishings), on top of the network's fixed wall damping |
+| `air_absorption` | `true` | distance low-pass on the direct path (HF dies with distance — true outdoors too) |
+| `diffuse_field_eq` | `false` | divide the HRIR set by its own diffuse-field response (third-octave smoothed, ±12 dB, 200 Hz–16 kHz) at build time: removes the measured head's tonal signature, keeps every interaural difference |
+
+## Head tracking
+
+Any app or device that sends an orientation over OSC works; the address and
+format are free. The reference setup is the Android app **Sensors2OSC** with
+the phone strapped to the headband:
+
+1. In Sensors2OSC, enable the **Game Rotation Vector** sensor — *not* the
+   plain Rotation Vector. The standard sensor fuses the magnetometer, whose
+   filtering adds 20–50 ms of latency and drifts near magnets (headphone
+   drivers qualify). Game Rotation Vector is gyro+accelerometer only and
+   tracks with no perceptible lag.
+2. Point it at the renderer's OSC port (default `9000`) and set
+   `head_tracking.osc_address: /gamerotationvector` (`format: auto` handles
+   the 4/5-float quaternion payload).
+3. If the renderer sees nothing while `tcpdump` does, check the host
+   firewall: incoming UDP on the OSC port must be allowed.
+4. Put the headphones on, look at the screen, press **Recenter** (Studio
+   panel or `/omniphony/control/head/recenter`). That direction becomes
+   "front".
+5. If the scene rotates the wrong way, toggle **Invert rotation**.
+6. If it rotates about the wrong axis — the phone is strapped on in some
+   other orientation than "screen up, top forward" — run the **axis
+   calibration** (Studio button **Calibrate axes**, or
+   `/omniphony/control/head/calibrate` with `front`, `left`, `up`): look
+   straight ahead and press, turn your head to the **left** and press, look
+   **up** and press. The turn gives the head's up axis in the sensor's frame,
+   the nod its right axis, and the result is stored next to the recenter
+   reference (`axes_quat`). `reset` forgets it. Three poses because a turn
+   alone cannot tell which horizontal direction is ahead, and this way
+   nothing is assumed about how the sensor is mounted.
+
+`smoothing` (0–0.99, default 0.2) trades a little latency for pose stability.
+It is a time constant, defined for a 30 Hz source: a 100 Hz tracker settles in
+the same milliseconds for the same value, not three times slower;
+with Game Rotation Vector you can usually lower it.
+
+### Other sources
+
+The setup above uses a phone, but any OSC orientation source works. For the
+**Waves Nx Head Tracker** (Bluetooth LE, Linux/BlueZ) there is a small Rust
+CLI — **[`nxosc`](https://github.com/mgth/nx-tracker-osc)** — that decodes the
+tracker and emits the same `/gamerotationvector` feed, so it drops straight
+into the steps above in place of Sensors2OSC:
+
+```sh
+nxosc run --profile omniphony --osc-address /gamerotationvector --osc-target 127.0.0.1:9000
+```
+
+Keep `head_tracking.osc_address: /gamerotationvector` and `format: auto`.
+`nxosc` also has a `--profile scenerotator` mode to drive an IEM SceneRotator
+directly instead.
+
+## Room responses (BRIR)
+
+A **binaural room impulse response** set is a measured listening room:
+for each loudspeaker of a real array and each orientation of a dummy head,
+the response at the two ears — propagation, interaural delay, early
+reflections and tail included. Selecting one as the HRIR source
+(`hrir_source: brir` + `brir_sofa_path`, or `brir:<path>` over OSC) renders
+the programme through that room instead of the HRTF stage's synthetic one.
+
+```yaml
+render:
+  binaural:
+    output_mode: binaural
+    hrir_source: brir
+    brir_sofa_path: /path/to/room.sofa
+```
+
+How it renders:
+
+- **The virtual-speaker path is implied.** A room response only knows its
+  loudspeakers, so the programme is first mixed onto the app's speaker layout
+  as a virtual room (the cascaded mode, whatever `mode` says), then each
+  virtual speaker is convolved with the pair measured from the set's nearest
+  loudspeaker. A channel whose label matches a virtual speaker is routed to
+  it directly, without panning: a 7.1.4 stream on a BRIR measured on a 7.1.4
+  array reaches the ears exactly as the measurement did. Configure the
+  speaker layout to match the set's loudspeakers for that; mismatches beyond
+  10° and loudspeakers shared by several virtual speakers are logged.
+- **Nothing else is added**: no ITD model, air absorption, reflections or
+  reverb — they are in the measurement. The LFE keeps its direct feed to
+  both ears.
+- **Head tracking** selects, per loudspeaker, the response measured at the
+  head orientation nearest to the tracked one (yaw and pitch; the sets
+  measure yaw), blended over a few milliseconds. Without a tracking address
+  only the orientation nearest straight ahead is loaded: the memory
+  difference is the whole set versus one orientation of it (a 12-loudspeaker
+  set at 2° steps over 360° and half a second of response is some 400 MB
+  resident with tracking, a few MB without).
+- **Latency**: the convolution adds 127 samples (2.6 ms at 48 kHz),
+  reported to the host with the crossover's for A/V sync.
+- **Conventions**: `MultiSpeakerBRIR` (loudspeakers × head orientations, the
+  BBC and Huddersfield databases), and the one-loudspeaker conventions
+  (`SingleRoomSRIR`, `SingleRoomDRIR`, or a `SimpleFreeFieldHRIR` carrying
+  room-length responses as the ASH Toolset exports) where each measured
+  source position becomes a loudspeaker. Every loudspeaker must have been
+  measured at every kept orientation. Responses are resampled to the engine
+  rate and normalised to unit mean direct-sound energy — the HRIR scale — so
+  switching between an HRTF and a BRIR keeps the level.
+- **While the file loads, or if it cannot be read**, the virtual room is
+  binauralised by the HRTF stage on the embedded KEMAR set instead, and the
+  load status (file, shape, or the error) is published to the control
+  surface.
+- **What still applies**: the head tracking, the headphone ear gains and the
+  BRIR options above. The diffuse-field EQ, head radius, update lattice,
+  distance scale, air absorption, reflections and reverb shape the HRTF
+  stage, which a room response bypasses; Studio does not show them for a
+  room, and the output-mode select offers only the virtual room. The state
+  snapshot's `binaural.modeEffective` says which path renders.
+
+### Where to get one
+
+- **BBC R&D listening room** ([bbcrd-brirs](https://github.com/bbc/bbcrd-brirs),
+  CC BY-SA 4.0): a Neumann KU100 in an ITU-R BS.1116 room, 32 loudspeakers
+  covering every ITU-R BS.2051 layout, 180 head orientations at 2°, 48 kHz.
+  One `MultiSpeakerBRIR` file per BS.2051 system at
+  <https://data.bbcarp.org.uk/bbcrd-brirs/sofa/>: `bbcrdlr_systemG.sofa`
+  (4+9+0: 0, ±30, ±45, ±90, ±135° at ear height, ±45 and ±110° at 40° up —
+  every 7.1.4 position and more, 274 MB) is the one for a 7.1.4 or 9.1.4
+  layout; `systemD` (4+5+0, 190 MB) for 5.1.4, `systemB` (0+5+0) for 5.1,
+  `all_speakers` (674 MB) for anything else. Loaded with head tracking it
+  holds about 280 MB of responses (0.33 s each after the tail cut), 1.6 MB
+  without; the reader needs about 1.1 GB while parsing the file.
+- **IoSR listening room** ([IoSR_ListeningRoom_BRIRs](https://github.com/IoSR-Surrey/IoSR_ListeningRoom_BRIRs),
+  CC BY 4.0): 24 loudspeakers in the 22.2 positions, head orientations at
+  2.5°, one 1.5 GB `MultiSpeakerBRIR`.
+- **ASH Toolset** ([ASH-Toolset](https://github.com/ShanonPearce/ASH-Toolset),
+  AGPL-3.0): exports a set for the directions you choose from its measured
+  rooms, as `SimpleFreeFieldHRIR`/`GeneralFIR` carrying room-length
+  responses — the per-direction shape above.
+- The University of Salford's SBSBRIR (12 loudspeakers at ear height) and
+  the Huddersfield 360° concert-hall set (one source on stage) are not
+  layouts: the first has no height layer, the second one loudspeaker.
+
+## Usage tips
+
+- **The room is YOUR room, not the scene's.** The reflections and the reverb
+  tail model the *listening* room — a constant, small, dry space, exactly like
+  the room around a loudspeaker setup. The mix's own acoustics (outdoor
+  ambience, cathedral reverb…) are in the content and pass through untouched;
+  the brain factors the constant listening-room signature out, and
+  externalization actually works best when that signature plausibly matches
+  the room you are sitting in. So: keep RT60 short and the levels modest, and
+  set the room dimensions roughly to your actual room.
+- **Externalization / "inside the head" feeling**: driven by the
+  direct-to-reverberant ratio. The late tail (`reverb.*`) does most of the
+  work, the early reflections add the room's geometry. Adjust **Reverb
+  level** and **Reflection level** by ear — too high colours dialogue and
+  sounds echoey, too low collapses back into the head.
+- **Tail character**: `reverb.size` sets how big the tail *sounds* at a
+  given RT60 (denser and smaller below 1, sparser and larger above), and
+  the two band ratios how it decays by band — a real room keeps its bass
+  longer than its treble, so a bass ratio a little above 1 and a treble
+  ratio below 1 (say 1.5 and 0.5) read as more natural than a flat decay.
+  All three are live in the **Late reverb** block of the panel.
+- **Distance**: past ~1 m the brain judges distance mostly from the
+  direct/reverb ratio, not loudness. The direct sound keeps its authored
+  level at any distance (there is no 1/d on it — the mixer set that level),
+  so the renderer moves the ratio from the other side: the reverb send grows
+  in proportion to the distance (unity at 1.5 m, capped at 6 m) and each
+  early reflection is levelled relative to the direct sound
+  (`d_source / d_image`), exactly as if the direct had fallen as 1/d and
+  been brought back up. Raising `unit_scale_m` therefore makes far objects
+  genuinely *sound* far without making them quieter. Air absorption adds
+  the matching "far sounds dull" high-frequency roll-off (bypassed within
+  3 m, ~14 kHz cutoff at 10 m, ~5 kHz at 30 m).
+- **Scale**: `unit_scale_m` sets how far "1 ADM unit" is in metres. At the
+  default 1.0 the far wall of the mix is one metre from your nose — try 3–4
+  for a room-sized stage. The reflection room grows on its own to contain
+  the scene: each half-extent is floored at `unit_scale_m + 0.35 m` (6.7 m
+  on every axis at a scale of 3, capped at 20 m), so the dimensions you set
+  are a minimum — a room smaller than the scene it holds has no physical
+  reading. Past the 20 m cap the image-source model pulls a source that
+  sits outside the room back inside before mirroring it, which keeps the
+  geometry valid but puts the reflections where the wall is, not where the
+  object is.
+- **ITD fit**: `head_radius_m` defaults to a KEMAR-ish 8.75 cm. If
+  localisation feels smeared, measure ear-to-ear width and set half of it.
+- **HRTF**: the embedded measured KEMAR (`saf`) is the best generic default —
+  but generic HRTFs rarely deliver elevation: the up/down cues are spectral
+  notches carved by *your* pinna, the most individual part of spatial
+  hearing. If elevation feels flat or the image sits too high, go HRTF
+  shopping: the **Browse…** button next to the HRTF select opens the
+  sofacoustics.org database (HUTUBS has 96 measured subjects under
+  `database/hutubs/` — try the `*_HRIRs_measured.sofa` files of a dozen
+  subjects and keep the best match). A click downloads and activates the
+  file live. `synthetic` is the no-measured-HRTF baseline (analytic head
+  shadow, no pinna colouration) — useful as an A/B reference.
+  SOFA support is compiled into liborender by default (`sofa` feature).
+- **Head-tracking reaction latency under mpv**: rendered audio waits in mpv's
+  output queue, so rotation is only audible once that queue drains. Set
+  `audio-buffer=0.05` in `mpv.conf` (default is 0.2 s) to cut the dominant
+  term. The Studio 3D head has its own low-latency pose channel and is not
+  affected by the audio buffer.
+- The output is plain stereo FL/FR — no special player-side configuration
+  beyond a stereo sink.
+
+## HRTF data licensing
+
+The SOFA *format* is an open AES standard; the *data* is not uniformly
+licensed — sofacoustics.org aggregates databases that each keep their own
+terms (HUTUBS is CC BY 4.0; some Aachen/ITA sets are CC BY-NC-SA; some files
+carry no license at all). Accordingly:
+
+- Omniphony never redistributes SOFA data: the browser downloads straight
+  from sofacoustics.org to your machine, on demand, with a local cache (the
+  app is just a user agent, like a web browser).
+- Each file's embedded `GLOBAL:License` / `AuthorContact` / `Organization`
+  attributes are read after download and shown in the browser (local list and
+  post-download status); non-commercial or missing licenses are flagged in
+  amber. A missing license legally means all rights reserved — contact the
+  author before anything beyond private listening.
+- The only bundled HRTF data is the embedded SAF KEMAR set (ISC license).
+- If you redistribute downloaded files yourself, the file's own license
+  applies to you — prefer CC BY / CC0 databases (e.g. HUTUBS).
+
+## OSC control surface
+
+| Address | Args | Meaning |
+|---|---|---|
+| `/omniphony/control/output_mode` | `s: speaker\|binaural` | select the output stage |
+| `/omniphony/control/binaural/hrir_source` | `s: synthetic\|saf\|sofa:<path>\|brir:<path>` | HRIR set, or a room response (see *Room responses*) |
+| `/omniphony/control/binaural/brir/head_tracking` | `s: auto` or `i\|f` (bool) | which head orientations of a BRIR stay resident: `auto` follows the tracking address, true = all, false = front only |
+| `/omniphony/control/binaural/brir/max_length` | `f` (s) | longest response kept (0 = whole) |
+| `/omniphony/control/binaural/brir/tail_floor` | `f` (dB) | tail cut, decibels below the response's total energy |
+| `/omniphony/control/binaural/unit_scale` | `f` (m/unit) | distance scale |
+| `/omniphony/control/binaural/head_radius` | `f` (m) | ITD head radius |
+| `/omniphony/control/binaural/reflections/enabled` | `i\|f` (bool) | reflections on/off |
+| `/omniphony/control/binaural/reflections/level` | `f` (0–1) | reflection gain |
+| `/omniphony/control/binaural/reflections/room_width` | `f` (m) | room x |
+| `/omniphony/control/binaural/reflections/room_depth` | `f` (m) | room y |
+| `/omniphony/control/binaural/reflections/room_height` | `f` (m) | room z |
+| `/omniphony/control/binaural/reflections/wall_cutoff` | `f` (Hz) | wall high-frequency cutoff |
+| `/omniphony/control/binaural/reverb/enabled` | `i\|f` (bool) | late tail on/off |
+| `/omniphony/control/binaural/reverb/level` | `f` (0–1) | reverb return level |
+| `/omniphony/control/binaural/reverb/rt60` | `f` (s) | decay time |
+| `/omniphony/control/binaural/reverb/predelay` | `f` (ms) | pre-delay |
+| `/omniphony/control/binaural/reverb/size` | `f` (0.5–2) | delay-line length scale |
+| `/omniphony/control/binaural/reverb/rt60_low_ratio` | `f` (0.25–4) | bass decay, as a ratio of RT60 |
+| `/omniphony/control/binaural/reverb/rt60_high_ratio` | `f` (0.25–4) | treble decay, as a ratio of RT60 |
+| `/omniphony/control/binaural/air_absorption` | `i\|f` (bool) | distance HF roll-off |
+| `/omniphony/control/binaural/diffuse_field_eq` | `i\|f` (bool) | diffuse-field equalisation of the HRIR set |
+| `/omniphony/control/head/orientation` | `fff` (euler) | set pose directly |
+| `/omniphony/control/head/quat` | `ffff` | set pose directly |
+| `/omniphony/control/head/recenter` | — | current orientation becomes "front" |
+| `/omniphony/control/head/calibrate` | `s: front\|left\|up\|reset` | three-pose sensor axis calibration (`front` also recenters) |
+| `/omniphony/control/head/tracking/address` | `s` | tracking OSC address ("" disables) |
+| `/omniphony/control/head/tracking/format` | `s` | `auto\|quat\|rotvec\|euler` |
+| `/omniphony/control/head/tracking/smoothing` | `f` (0–0.99) | pose smoothing |
+| `/omniphony/control/head/tracking/invert` | `i` (bool) | mirror the rotation |
+
+State broadcast: the `binaural` object inside `/omniphony/state/renderer`
+(10 Hz when the pose moves) — including `hrirEffective`, the set actually
+being convolved, and `hrirError`: when a SOFA file cannot be loaded the
+renderer falls back to the embedded KEMAR set, and these two say so
+(`hrirSource` keeps the request) — plus a dedicated lightweight
+`/omniphony/state/head_pose` (`ffff` = w x y z, ~30 Hz) for low-latency pose
+consumers such as the Studio 3D head.

@@ -1,0 +1,8 @@
+# Direct runtime and test pins for the Python >=3.11 baseline.
+coverage==7.16.1
+fastapi==0.141.1
+httpx2==2.13.1
+pytest==9.1.1
+python-mpv==1.0.8
+redis==8.1.0
+uvicorn[standard]==0.53.0

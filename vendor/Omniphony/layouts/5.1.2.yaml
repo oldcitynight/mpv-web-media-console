@@ -1,0 +1,65 @@
+# 5.1.2 immersive speaker layout
+#
+# 5.1 bed with 2 top-front channels in normalized Cartesian coordinates.
+# 8 channels total fit a standard 7.1 sound card: wire the two height
+# speakers (TFL/TFR) to the side-surround outputs (channels 7-8), which is
+# why they take the SL/SR slots in this file's channel order.
+# LFE remains non-spatialized.
+# Total: 8 channels (including LFE)
+
+speakers:
+  - name: "FL"
+    coord_mode: "cartesian"
+    x: -1.0
+    y: 1.0
+    z: 0.0
+    spatialize: true
+
+  - name: "FR"
+    coord_mode: "cartesian"
+    x: 1.0
+    y: 1.0
+    z: 0.0
+    spatialize: true
+
+  - name: "C"
+    coord_mode: "cartesian"
+    x: 0.0
+    y: 1.0
+    z: 0.0
+    spatialize: true
+
+  - name: "LFE"
+    coord_mode: "cartesian"
+    x: 1.0
+    y: 1.0
+    z: -0.5
+    spatialize: false
+
+  - name: "BL"
+    coord_mode: "cartesian"
+    x: -1.0
+    y: -1.0
+    z: 0.0
+    spatialize: true
+
+  - name: "BR"
+    coord_mode: "cartesian"
+    x: 1.0
+    y: -1.0
+    z: 0.0
+    spatialize: true
+
+  - name: "TFL"
+    coord_mode: "cartesian"
+    x: -1.0
+    y: 1.0
+    z: 1.0
+    spatialize: true
+
+  - name: "TFR"
+    coord_mode: "cartesian"
+    x: 1.0
+    y: 1.0
+    z: 1.0
+    spatialize: true

@@ -1,0 +1,25 @@
+include .gitignore LICENSE README.md THIRD_PARTY_NOTICES.md UPSTREAM_PATCHES.md requirements.lock
+recursive-include frontend *.vue *.ts *.css *.html *.json
+recursive-include runtime_sql *.sql *.md
+recursive-include contracts *.json *.yaml
+graft vendor
+graft packaging
+graft licenses
+recursive-include docs README.*.md
+prune frontend/node_modules
+prune frontend/dist
+prune build
+prune dist
+prune local-support
+global-exclude __pycache__ *.py[cod] *.egg-info *.so *.so.* *.dll *.dylib *.o *.a *.whl *.sqlite *.sqlite-* *.db *.db-* *.log
+
+prune control
+prune tests
+prune fixtures
+prune .agents
+prune .codex
+prune .aws
+prune .ssh
+prune .gnupg
+prune frontend/tests
+global-exclude *.key *.pem *.p12 *.pfx *.bundle *.tar.gz *.tar.xz *.zip .env .env.*

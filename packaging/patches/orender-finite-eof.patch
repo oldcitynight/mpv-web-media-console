@@ -1,0 +1,29 @@
+--- a/omniphony-renderer/src/cli/decode/session_run.rs
++++ b/omniphony-renderer/src/cli/decode/session_run.rs
+@@ -621,6 +621,7 @@
+     handler: &mut DecodeHandler,
+     ctx: &DecodeRunContext<'_>,
+     drain_tx: &mpsc::Sender<u64>,
++    decoder_thread: &std::thread::JoinHandle<Result<()>>,
+ ) -> Result<()> {
+     let mut idle_feeder = IdleFeeder::default();
+     loop {
+@@ -630,6 +631,9 @@
+         let result = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+             Ok(result) => result,
+             Err(mpsc::RecvTimeoutError::Timeout) => {
++                if !ctx.args.continuous && decoder_thread.is_finished() {
++                    break;
++                }
+                 if sys::ShutdownHandle::is_requested()
+                     || sys::ShutdownHandle::is_restart_from_config_requested()
+                 {
+@@ -759,7 +763,7 @@
+     let run_ctx = DecodeRunContext { args };
+ 
+     sys::notify_ready();
+-    process_decoder_messages(&prepared.rx, handler, &run_ctx, &prepared.drain_tx)
++    process_decoder_messages(&prepared.rx, handler, &run_ctx, &prepared.drain_tx, &prepared.decode_thread)
+ }
+ 
+ fn finalize_render_run(

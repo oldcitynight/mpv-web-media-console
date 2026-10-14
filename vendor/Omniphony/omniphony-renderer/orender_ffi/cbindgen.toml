@@ -1,0 +1,19 @@
+language = "C"
+pragma_once = true
+include_guard = "ORENDER_H"
+tab_width = 4
+documentation = true
+documentation_style = "c99"
+
+[parse]
+parse_deps = false
+
+[export]
+prefix = ""
+# The label enum is not referenced by any signature (labels cross as raw bytes),
+# so cbindgen only emits it when listed explicitly.
+include = ["OrenderChannelLabel"]
+
+[enum]
+# C has one flat namespace: emit OrenderChannelLabel_L, not a bare `L`/`C`.
+prefix_with_name = true

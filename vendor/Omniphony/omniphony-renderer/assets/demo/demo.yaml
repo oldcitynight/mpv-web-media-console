@@ -1,0 +1,24 @@
+# Demo render config: binaural headphone output.
+#
+# Selecting `render.binaural.output_mode: binaural` bypasses the speaker/VBAP
+# chain and renders every input channel (bed + objects) straight to 2-channel
+# stereo through an HRTF, with ITD, early reflections and a short reverb tail —
+# so the rotating 7.1.4 demo bed is heard as a moving source around the head.
+#
+# See omniphony-renderer/BINAURAL.md for the full configuration reference.
+render:
+  binaural:
+    output_mode: binaural
+    # Embedded measured KEMAR HRTF — the best generic default.
+    hrir_source: saf
+    # Metres per layout unit; 3 m puts the ring at a room-sized distance.
+    unit_scale_m: 3.0
+    # Shoebox early reflections aid externalisation ("out of the head").
+    reflections:
+      enabled: true
+      level: 0.4
+    # Short late-reverb tail (a small listening room, not a hall).
+    reverb:
+      enabled: true
+      level: 0.2
+      rt60_s: 0.3

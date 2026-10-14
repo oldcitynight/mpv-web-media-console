@@ -1,0 +1,222 @@
+name: Integration Build
+
+# Rolling pre-release test build for testers, built from `main` (integration).
+# Manual on demand + once daily; the daily run is skipped when `main` hasn't
+# moved since the last publish (see the `check` job), so the release date stays
+# meaningful and no identical assets get republished.
+# Published under a single rolling `integration`
+# tag and marked as a pre-release, so GitHub never shows it as the "Latest"
+# release (Latest = newest non-prerelease, non-draft). Testers always grab the
+# same URL; assets are replaced each run, not accumulated.
+#
+# Assets are renamed to `Omniphony-Studio-integration-<os>-x86_64.<ext>` rather
+# than the version-stamped names tauri-action emits, so they can't be mistaken
+# for a stable release (consistent with mpv-omniphony's integration bundles).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *' # daily 04:00 UTC
+
+jobs:
+  # Scheduled runs are skipped when `main` hasn't moved since the last
+  # published integration build (the rolling `integration` tag is recreated at
+  # the built commit on every publish, so tag SHA == HEAD means nothing new).
+  # Manual dispatch always builds, so a rebuild can still be forced on demand
+  # (e.g. after a toolchain or runner-image change).
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.cmp.outputs.should_build }}
+    steps:
+      - name: Compare integration tag with HEAD
+        id: cmp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Manual dispatch: building unconditionally."
+            exit 0
+          fi
+          # The tag is created by action-gh-release as a lightweight tag, so
+          # object.sha is the commit itself (no annotated-tag dereference).
+          tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/integration" \
+            --jq .object.sha 2>/dev/null || true)
+          if [ "$tag_sha" = "$GITHUB_SHA" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "integration tag already at $GITHUB_SHA — skipping rebuild."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "main moved (tag: ${tag_sha:-none}, HEAD: $GITHUB_SHA) — building."
+          fi
+
+  build-studio:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+          - platform: windows-latest
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # ── Toolchains ────────────────────────────────────────────────────────
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        # Caching is an optimization, not a correctness step: a crash of the
+        # cache action (e.g. the Node-20 entrypoint forced onto Node 24 dying on
+        # the Windows runner) must never fail the build.
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            omniphony-renderer/target
+            omniphony-studio/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('omniphony-renderer/Cargo.lock', 'omniphony-studio/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── Platform dependencies ─────────────────────────────────────────────
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          # PPA required: ubuntu-22.04 ships PipeWire 0.3.48 but pipewire-rs 0.9.x
+          # needs >= 0.3.65. This PPA provides a compatible 0.3.85+ build.
+          for attempt in 1 2 3; do
+            if sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to add PipeWire PPA after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          for attempt in 1 2 3; do
+            if sudo apt-get update; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "apt-get update failed after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libpipewire-0.3-dev \
+            pkg-config
+
+      # Required to compile cpal with ASIO on Windows. Licensing rationale and
+      # the pinned SDK commit both live in the action.
+      - name: Setup ASIO SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-asio-sdk
+
+      # ── Build (no publish — we rename + publish ourselves below) ──────────
+
+      - name: Install npm dependencies
+        working-directory: omniphony-studio
+        run: npm ci
+
+      # The cargo cache restores src-tauri/target, which still holds bundle
+      # artifacts from earlier runs (older versions). The staging step below
+      # globs the bundle dir and picks matches[0] — the lowest version present —
+      # so a fresh 0.3.3 build was being published as a stale 0.3.2 bundle. Wipe
+      # stale bundles before rebuilding; compiled deps in target/ are kept, so
+      # this does not force a full recompile.
+      - name: Remove stale bundles restored from cache
+        shell: bash
+        run: rm -rf omniphony-studio/src-tauri/target/release/bundle
+
+      # No tagName → tauri-action only builds (runs beforeBuildCommand: frontend
+      # build + prepare-sidecar), leaving bundles under src-tauri/target/.../bundle/.
+      - name: Build Studio bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: omniphony-studio
+          # Passed through to the cargo Tauri runs for src-tauri; see release.yml.
+          args: -- --locked
+
+      # Rename to clear, version-less `integration` names so testers don't mistake
+      # them for a stable release. Each platform emits a distinct set of extensions.
+      - name: Stage renamed bundles
+        shell: bash
+        run: |
+          set -e
+          B=omniphony-studio/src-tauri/target/release/bundle
+          mkdir -p staging
+          shopt -s nullglob
+          copy_one() { # <glob> <dest>
+            local matches=( $1 )
+            if [ ${#matches[@]} -gt 0 ]; then
+              cp "${matches[0]}" "staging/$2"
+              echo "staged $2  <-  ${matches[0]}"
+            fi
+          }
+          copy_one "$B/deb/*.deb"            "Omniphony-Studio-integration-linux-x86_64.deb"
+          copy_one "$B/appimage/*.AppImage"  "Omniphony-Studio-integration-linux-x86_64.AppImage"
+          copy_one "$B/rpm/*.rpm"            "Omniphony-Studio-integration-linux-x86_64.rpm"
+          copy_one "$B/msi/*.msi"            "Omniphony-Studio-integration-windows-x86_64.msi"
+          copy_one "$B/nsis/*-setup.exe"     "Omniphony-Studio-integration-windows-x86_64-setup.exe"
+          ls -la staging/
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v7
+        with:
+          name: studio-bundles-${{ runner.os }}
+          path: staging/*
+
+  publish-integration:
+    needs: build-studio
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all bundles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: studio-bundles-*
+          merge-multiple: true
+          path: dist
+
+      # Reset the rolling release + tag so assets are replaced, not accumulated.
+      - name: Delete previous integration release + tag (if any)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete integration --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+
+      - name: Publish rolling integration pre-release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: integration
+          name: 'Omniphony Studio (integration build)'
+          prerelease: true
+          make_latest: false
+          body: |
+            Rolling integration build of Omniphony Studio from `main` — for testers,
+            NOT a stable release. Rebuilt daily and on demand; assets here are
+            replaced each run. File names carry `integration` rather than a version
+            so they can't be confused with the official release.
+          files: dist/*

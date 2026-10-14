@@ -1,0 +1,65 @@
+# liborender C ABI contract
+
+`orender_ffi` builds the engine's only stable C surface: `liborender.so.<major>`
+(Linux) / `orender.dll` (Windows) / `liborender.dylib` (macOS), described by the
+generated header `orender_ffi/include/orender.h`. Known consumers: mpv's
+`ad_orender.c` decoder + `orender_overlay.c` overlay client, and the smoke test
+`orender_ffi/examples/smoke.c`. The `orender` CLI does NOT use this ABI — it
+links the engine as a Rust crate.
+
+## Version numbers (who is who)
+
+| Number | Where | Meaning |
+|---|---|---|
+| ABI major (`ORENDER_ABI_MAJOR`) | `orender_ffi/src/lib.rs`, `#define` in header, `orender_version_major()` | Breaking-change counter. Linux soname `liborender.so.<major>` derives from it (build.rs). |
+| ABI minor (`ORENDER_ABI_MINOR`) | same | Additive-change counter. Logging/diagnostics only. |
+| Crate version (`orender_ffi/Cargo.toml`) | crate, `orender_build_id()`, `liborender-v*` release tags, Arch `pkgver` | Package/release identity. Moves faster than the ABI pair. |
+| Build fingerprint | `orender_build_id()`, `/omniphony/state/render/version` | git-describe + build time; identifies the exact build. |
+
+The ABI pair and the crate version have different lifecycles on purpose: a
+release with no header change bumps the crate version only.
+
+## Change policy
+
+- **Additive** (new exported function, new `orender_set_option` key, enum value
+  **appended**): bump `ORENDER_ABI_MINOR`. Existing consumers keep working
+  unchanged.
+- **Breaking** (changing/removing a symbol or its semantics, touching a struct
+  layout, reordering/removing enum values): bump `ORENDER_ABI_MAJOR`, reset
+  minor to 0. The Linux soname follows automatically; Windows/macOS file names
+  do not change — consumers there are protected only by the runtime check.
+
+**`OrenderConfig` is frozen at ABI major 0.** It crosses the boundary by layout
+with no size handshake. New knobs go through `orender_set_option` (post-create)
+or the config YAML (create-time), never through new struct fields.
+
+**`OrenderChannelLabel` is append-only** and must mirror
+`bridge_api::RChannelLabel` exactly — a unit test in `orender_ffi` asserts
+discriminant parity and breaks the build when `bridge_api` adds a variant.
+
+## Consumer contract
+
+At load time a consumer must:
+
+1. Resolve `orender_version_major`/`orender_version_minor` first; reject the
+   library if they are missing (pre-handshake build).
+2. Reject the library if `orender_version_major() != ORENDER_ABI_MAJOR` it was
+   compiled against.
+3. Gate optional features on **symbol presence** (`dlsym`), not on the minor.
+   The minor is for logs. This makes both skew directions degrade gracefully:
+   an older library just lacks the newer optional symbols; a newer library
+   keeps every old symbol working.
+4. Log `orender_build_id()` (when present) and the path the library was loaded
+   from.
+
+Probing an `orender_set_option` key: a return of `-1` means "this build does
+not know that key" — treat it as feature-unavailable, not as an error.
+
+## Bump checklist
+
+1. Edit `ORENDER_ABI_MINOR` (or `MAJOR`) in `orender_ffi/src/lib.rs` and extend
+   the changelog comment above it.
+2. `cargo build -p orender_ffi` — regenerates `include/orender.h`; commit it.
+3. If breaking: expect the soname to change; update packaging (`PKGBUILD`
+   symlinks) and warn mpv-omniphony (bundled lib name changes).
+4. `cargo test -p orender_ffi` + run `examples/smoke.c` (CI does both).

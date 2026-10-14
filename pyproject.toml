@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools==82.0.1", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpv-web-suite"
+version = "0.0.1"
+description = "Linux-local browser control suite for libmpv playback"
+readme = "README.md"
+license = "GPL-3.0-only"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "UPSTREAM_PATCHES.md", "licenses/frontend/Vue-LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.53.0",
+    "redis==8.1.0",
+    "python-mpv==1.0.8",
+]
+
+[project.scripts]
+mpv-webd = "backend.cli:main"
+mpv-player-host = "player_host.host_process:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*", "player_host*"]
+namespaces = false
+
+[tool.setuptools.data-files]
+"share/mpv-web-suite/runtime_sql" = ["runtime_sql/*.sql"]
+"share/mpv-web-suite/frontend" = ["frontend/dist/index.html"]
+"share/mpv-web-suite/frontend/assets" = ["frontend/dist/assets/*"]
+
+"share/mpv-web-suite/licenses/frontend" = ["licenses/frontend/*"]

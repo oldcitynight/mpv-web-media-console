@@ -1,0 +1,991 @@
+//! Speaker layout configuration parser
+//!
+//! This module handles parsing speaker layout YAML files for VBAP spatial rendering.
+//! Speaker layouts define the physical positions of speakers in a listening environment
+//! using azimuth and elevation angles.
+//!
+//! # YAML Format
+//!
+//! ```yaml
+//! # 7.1.4 spatial audio layout
+//! speakers:
+//!   - name: "FL"
+//!     azimuth: -30.0
+//!     elevation: 0.0
+//!   - name: "FR"
+//!     azimuth: 30.0
+//!     elevation: 0.0
+//!   # ... more speakers
+//! ```
+//!
+//! # Coordinate System
+//!
+//! - **Azimuth**: -180° to +180° (0° = front, -90° = left, 90° = right, ±180° = rear)
+//! - **Elevation**: -90° to +90° (0° = horizontal, +90° = zenith, -90° = nadir)
+//!
+//! # Example
+//!
+//! ```ignore
+//! use omniphony_renderer::speaker_layout::SpeakerLayout;
+//!
+//! let layout = SpeakerLayout::from_file("../layouts/7.1.4.yaml")?;
+//! println!("Loaded {} speakers", layout.num_speakers());
+//!
+//! // Get positions for VBAP
+//! let positions = layout.positions();
+//! ```
+
+use anyhow::{Context, Result};
+use omniphony_geometry::f32 as geometry;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+
+/// Legacy 0-9 bed id for a channel label. The renderer no longer routes by
+/// bed id — the only remaining consumer is the CLI file-export bed
+/// conformance, which keeps the fixed 10-slot export order
+/// (`docs/channel-object-contract.md`).
+pub fn legacy_bed_id(label: bridge_api::RChannelLabel) -> Option<usize> {
+    use bridge_api::RChannelLabel as Label;
+    match label {
+        Label::L => Some(0),
+        Label::R => Some(1),
+        Label::C => Some(2),
+        Label::LFE => Some(3),
+        Label::Ls => Some(4),
+        Label::Rs => Some(5),
+        Label::Lb => Some(6),
+        Label::Rb => Some(7),
+        Label::Tfl => Some(8),
+        Label::Tfr => Some(9),
+        // The height tier's front pair fills the same two height slots: the
+        // export shape has room for one front-height pair, whichever tier
+        // the presentation names it from.
+        Label::Lh => Some(8),
+        Label::Rh => Some(9),
+        _ => None,
+    }
+}
+
+/// A single speaker in the layout
+#[derive(Debug, Clone, PartialEq)]
+pub struct Speaker {
+    /// Speaker name (e.g., "FL", "FR", "C", "TFL")
+    pub name: String,
+
+    /// Azimuth in degrees (-180 to +180)
+    /// 0° = front, -90° = left, 90° = right, ±180° = rear
+    pub azimuth: f32,
+
+    /// Elevation in degrees (-90 to +90)
+    /// 0° = horizontal, +90° = zenith, -90° = nadir
+    pub elevation: f32,
+
+    /// Distance from the listening position in metres (default: 1.0).
+    /// Not used for rendering but transmitted via OSC for visualisation.
+    pub distance: f32,
+
+    /// Public coordinate source of truth for persistence and UI round-trips.
+    pub coord_mode: String,
+
+    /// Normalized Omniphony Cartesian coordinates in [-1, 1].
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+
+    /// Whether this speaker participates in VBAP spatialization
+    /// Set to false for LFE/subwoofers (default: true)
+    pub spatialize: bool,
+
+    /// Per-entry gain in dB (default: 0 = unity). Used by the virtual bed as
+    /// the per-input-channel trim (0.1 dB resolution, like the per-speaker
+    /// output gain); ignored for output-layout speakers.
+    pub gain_db: f32,
+
+    /// Per-speaker output delay in milliseconds (default: 0.0).
+    pub delay_ms: f32,
+
+    /// Lowest frequency this speaker can reproduce, in Hz (default: None = 0 Hz).
+    pub freq_low: Option<f32>,
+
+    /// Highest frequency this speaker can reproduce, in Hz (default: None = +∞ Hz).
+    pub freq_high: Option<f32>,
+}
+
+fn default_coord_mode() -> String {
+    "polar".to_string()
+}
+
+fn default_spatialize() -> bool {
+    true
+}
+
+fn default_delay_ms() -> f32 {
+    0.0
+}
+
+fn default_radius_m() -> f32 {
+    1.0
+}
+
+fn speaker_with_distance(
+    name: impl Into<String>,
+    azimuth: f32,
+    elevation: f32,
+    distance: f32,
+) -> Speaker {
+    Speaker::from_polar(name, azimuth, elevation, distance, true, 0.0)
+}
+
+#[derive(Deserialize)]
+struct RawSpeaker {
+    name: String,
+    azimuth: Option<f32>,
+    elevation: Option<f32>,
+    distance: Option<f32>,
+    #[serde(default = "default_coord_mode")]
+    coord_mode: String,
+    x: Option<f32>,
+    y: Option<f32>,
+    z: Option<f32>,
+    #[serde(default = "default_spatialize")]
+    spatialize: bool,
+    #[serde(default)]
+    gain_db: f32,
+    #[serde(default = "default_delay_ms")]
+    delay_ms: f32,
+    #[serde(default)]
+    freq_low: Option<f32>,
+    #[serde(default)]
+    freq_high: Option<f32>,
+}
+
+impl<'de> Deserialize<'de> for Speaker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawSpeaker::deserialize(deserializer)?;
+        let coord_mode = if raw.coord_mode.eq_ignore_ascii_case("cartesian") {
+            "cartesian".to_string()
+        } else {
+            "polar".to_string()
+        };
+        let (azimuth, elevation, distance, x, y, z) =
+            if let (Some(x), Some(y), Some(z)) = (raw.x, raw.y, raw.z) {
+                let x = x.clamp(-1.0, 1.0);
+                let y = y.clamp(-1.0, 1.0);
+                let z = z.clamp(-1.0, 1.0);
+                let (az, el, dist) = geometry::to_spherical(x, y, z);
+                (
+                    raw.azimuth.unwrap_or(az),
+                    raw.elevation.unwrap_or(el),
+                    raw.distance.unwrap_or(dist).max(0.01),
+                    x,
+                    y,
+                    z,
+                )
+            } else {
+                let az = raw.azimuth.unwrap_or(0.0);
+                let el = raw.elevation.unwrap_or(0.0);
+                let dist = raw.distance.unwrap_or(1.0).max(0.01);
+                let (x, y, z) = geometry::hydrate_from_spherical(az, el, dist);
+                (az, el, dist, x, y, z)
+            };
+        Ok(Self {
+            name: raw.name,
+            azimuth,
+            elevation,
+            distance,
+            coord_mode,
+            x,
+            y,
+            z,
+            spatialize: raw.spatialize,
+            gain_db: raw.gain_db,
+            delay_ms: raw.delay_ms,
+            freq_low: raw.freq_low.filter(|value| *value > 0.0),
+            freq_high: raw.freq_high.filter(|value| *value > 0.0),
+        })
+    }
+}
+
+impl Serialize for Speaker {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let cartesian = self.coord_mode.eq_ignore_ascii_case("cartesian");
+        let field_count = 9;
+        let mut state = serializer.serialize_struct("Speaker", field_count)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("coord_mode", if cartesian { "cartesian" } else { "polar" })?;
+        if cartesian {
+            state.serialize_field("x", &self.x)?;
+            state.serialize_field("y", &self.y)?;
+            state.serialize_field("z", &self.z)?;
+        } else {
+            state.serialize_field("azimuth", &self.azimuth)?;
+            state.serialize_field("elevation", &self.elevation)?;
+            state.serialize_field("distance", &self.distance)?;
+        }
+        state.serialize_field("spatialize", &self.spatialize)?;
+        // Same 0.01 dB write tolerance as the render-config gains: below that
+        // is inaudible and must not re-add a key the user never set.
+        if self.gain_db.abs() > 0.01 {
+            state.serialize_field("gain_db", &self.gain_db)?;
+        }
+        state.serialize_field("delay_ms", &self.delay_ms)?;
+        if self.freq_low.is_some() {
+            state.serialize_field("freq_low", &self.freq_low)?;
+        }
+        if self.freq_high.is_some() {
+            state.serialize_field("freq_high", &self.freq_high)?;
+        }
+        state.end()
+    }
+}
+
+impl Speaker {
+    pub fn from_polar(
+        name: impl Into<String>,
+        azimuth: f32,
+        elevation: f32,
+        distance: f32,
+        spatialize: bool,
+        delay_ms: f32,
+    ) -> Self {
+        let distance = distance.max(0.01);
+        let (x, y, z) = geometry::hydrate_from_spherical(azimuth, elevation, distance);
+        Self {
+            name: name.into(),
+            azimuth,
+            elevation,
+            distance,
+            coord_mode: "polar".to_string(),
+            x,
+            y,
+            z,
+            spatialize,
+            gain_db: 0.0,
+            delay_ms: delay_ms.max(0.0),
+            freq_low: None,
+            freq_high: None,
+        }
+    }
+
+    /// Create a speaker from normalised cartesian coordinates in `[-1, 1]`,
+    /// deriving the polar representation — the same conversion the YAML
+    /// deserializer applies to a `coord_mode: cartesian` entry.
+    pub fn from_cartesian(
+        name: impl Into<String>,
+        x: f32,
+        y: f32,
+        z: f32,
+        spatialize: bool,
+        delay_ms: f32,
+    ) -> Self {
+        let x = x.clamp(-1.0, 1.0);
+        let y = y.clamp(-1.0, 1.0);
+        let z = z.clamp(-1.0, 1.0);
+        let (azimuth, elevation, distance) = geometry::to_spherical(x, y, z);
+        Self {
+            name: name.into(),
+            azimuth,
+            elevation,
+            distance: distance.max(0.01),
+            coord_mode: "cartesian".to_string(),
+            x,
+            y,
+            z,
+            spatialize,
+            gain_db: 0.0,
+            delay_ms: delay_ms.max(0.0),
+            freq_low: None,
+            freq_high: None,
+        }
+    }
+
+    pub fn with_freq_low(mut self, freq_low: f32) -> Self {
+        self.freq_low = Some(freq_low.max(0.0));
+        self
+    }
+
+    pub fn with_freq_high(mut self, freq_high: f32) -> Self {
+        self.freq_high = Some(freq_high.max(0.0));
+        self
+    }
+
+    /// Create a new speaker (spatialize defaults to true)
+    pub fn new(name: impl Into<String>, azimuth: f32, elevation: f32) -> Self {
+        Self::from_polar(name, azimuth, elevation, 1.0, true, 0.0)
+    }
+
+    /// Create a new speaker with explicit spatialize flag
+    pub fn new_with_spatialize(
+        name: impl Into<String>,
+        azimuth: f32,
+        elevation: f32,
+        spatialize: bool,
+    ) -> Self {
+        Self::from_polar(name, azimuth, elevation, 1.0, spatialize, 0.0)
+    }
+
+    /// Get position as [azimuth, elevation] array for VBAP
+    pub fn position(&self) -> [f32; 2] {
+        [self.azimuth, self.elevation]
+    }
+
+    /// Validate speaker angles are in valid range
+    pub fn validate(&self) -> Result<()> {
+        if self.azimuth < -180.0 || self.azimuth > 180.0 {
+            anyhow::bail!(
+                "Speaker '{}': azimuth {:.1}° out of range [-180, 180]",
+                self.name,
+                self.azimuth
+            );
+        }
+
+        if self.elevation < -90.0 || self.elevation > 90.0 {
+            anyhow::bail!(
+                "Speaker '{}': elevation {:.1}° out of range [-90, 90]",
+                self.name,
+                self.elevation
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Speaker layout configuration
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct SpeakerLayout {
+    /// Physical metres-per-unit scale for UI distance/delay conversion.
+    #[serde(default = "default_radius_m")]
+    pub radius_m: f32,
+    /// List of speakers in the layout
+    pub speakers: Vec<Speaker>,
+}
+
+impl SpeakerLayout {
+    /// Load speaker layout from YAML file
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path)
+            .with_context(|| format!("Failed to open speaker layout file: {}", path.display()))?;
+
+        let reader = BufReader::new(file);
+        let layout: SpeakerLayout = serde_yaml_ng::from_reader(reader)
+            .with_context(|| format!("Failed to parse speaker layout YAML: {}", path.display()))?;
+
+        layout.validate()?;
+
+        Ok(layout)
+    }
+
+    /// Parse a speaker layout from a YAML string (same schema as
+    /// [`from_file`](Self::from_file)). Used to apply a layout received over OSC
+    /// (e.g. the virtual bed) without touching the filesystem.
+    pub fn from_yaml_str(yaml: &str) -> Result<Self> {
+        let layout: SpeakerLayout =
+            serde_yaml_ng::from_str(yaml).context("Failed to parse speaker layout YAML")?;
+        layout.validate()?;
+        Ok(layout)
+    }
+
+    /// Parse a set of placement entries from a YAML string: the same schema
+    /// as a layout, but a family's entries are a partial set — one channel
+    /// is a legitimate list, and so is none — so only each entry and the
+    /// names' uniqueness are validated, not the VBAP minimum an *output*
+    /// layout needs.
+    pub fn entries_from_yaml_str(yaml: &str) -> Result<Self> {
+        let layout: SpeakerLayout =
+            serde_yaml_ng::from_str(yaml).context("Failed to parse channel entries YAML")?;
+        for speaker in &layout.speakers {
+            speaker.validate()?;
+        }
+        let mut names = std::collections::HashSet::new();
+        for speaker in &layout.speakers {
+            if !names.insert(speaker.name.as_str()) {
+                anyhow::bail!("Duplicate channel entry: '{}'", speaker.name);
+            }
+        }
+        Ok(layout)
+    }
+
+    /// Create a speaker layout from a vector of speakers
+    pub fn from_speakers(speakers: Vec<Speaker>) -> Result<Self> {
+        let layout = Self {
+            radius_m: 1.0,
+            speakers,
+        };
+        layout.validate()?;
+        Ok(layout)
+    }
+
+    /// Get number of speakers in the layout
+    pub fn num_speakers(&self) -> usize {
+        self.speakers.len()
+    }
+
+    /// Get speaker positions as [[az, el], ...] for VBAP
+    pub fn positions(&self) -> Vec<[f32; 2]> {
+        self.speakers.iter().map(|s| s.position()).collect()
+    }
+
+    /// Get positions for speakers that participate in spatialization (spatialize=true)
+    /// Returns (positions, vbap_to_speaker_mapping)
+    /// - positions: Vec of [az, el] for VBAP
+    /// - mapping: Vec mapping VBAP index → speaker index
+    pub fn spatializable_positions(&self) -> (Vec<[f32; 2]>, Vec<usize>) {
+        let mut positions = Vec::new();
+        let mut mapping = Vec::new();
+
+        for (speaker_idx, speaker) in self.speakers.iter().enumerate() {
+            if speaker.spatialize {
+                positions.push(speaker.position());
+                mapping.push(speaker_idx);
+            }
+        }
+
+        (positions, mapping)
+    }
+
+    /// Get positions for speakers that participate in spatialization, with
+    /// cartesian speakers converted to directions in the same room-ratio space
+    /// as rendered objects.
+    pub fn spatializable_positions_for_room(
+        &self,
+        room_ratio: [f32; 3],
+        room_ratio_rear: f32,
+        room_ratio_lower: f32,
+        room_ratio_center_blend: f32,
+    ) -> (Vec<[f32; 2]>, Vec<usize>) {
+        let mut positions = Vec::new();
+        let mut mapping = Vec::new();
+
+        for (speaker_idx, speaker) in self.speakers.iter().enumerate() {
+            if !speaker.spatialize {
+                continue;
+            }
+            let pos = if speaker.coord_mode.eq_ignore_ascii_case("cartesian") {
+                let scaled_x = speaker.x * room_ratio[0];
+                let scaled_y = geometry::map_depth(
+                    speaker.y,
+                    room_ratio[1],
+                    room_ratio_rear,
+                    room_ratio_center_blend,
+                );
+                let scaled_z = if speaker.z >= 0.0 {
+                    speaker.z * room_ratio[2]
+                } else {
+                    speaker.z * room_ratio_lower
+                };
+                let (az, el, _) =
+                    crate::spatial_vbap::adm_to_spherical(scaled_x, scaled_y, scaled_z);
+                [az, el]
+            } else {
+                speaker.position()
+            };
+            positions.push(pos);
+            mapping.push(speaker_idx);
+        }
+
+        (positions, mapping)
+    }
+
+    /// Get speaker names
+    pub fn speaker_names(&self) -> Vec<&str> {
+        self.speakers.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// Per-label speaker lookup: each recognised speaker name (shared alias
+    /// table) maps its channel label to the speaker index; the first speaker
+    /// matching a label wins. This is the layout-independent routing language
+    /// of `docs/channel-object-contract.md` — a stored `RChannelLabel` stays
+    /// valid across layout swaps, the topology re-resolves it here.
+    pub fn label_to_speaker_mapping(
+        &self,
+    ) -> std::collections::HashMap<bridge_api::RChannelLabel, usize> {
+        let mut mapping = std::collections::HashMap::new();
+        for (speaker_idx, speaker) in self.speakers.iter().enumerate() {
+            let label = bridge_api::labels::label_for_name(&speaker.name);
+            if label != bridge_api::RChannelLabel::Unknown {
+                mapping.entry(label).or_insert(speaker_idx);
+            }
+        }
+        mapping
+    }
+
+    /// Validate the layout
+    pub fn validate(&self) -> Result<()> {
+        if self.speakers.is_empty() {
+            anyhow::bail!("Speaker layout must contain at least one speaker");
+        }
+
+        if self.speakers.len() < 3 {
+            anyhow::bail!(
+                "VBAP requires at least 3 speakers, found {}",
+                self.speakers.len()
+            );
+        }
+
+        // Validate each speaker
+        for speaker in &self.speakers {
+            speaker.validate()?;
+        }
+
+        // Check for duplicate names
+        let mut names = std::collections::HashSet::new();
+        for speaker in &self.speakers {
+            if !names.insert(speaker.name.as_str()) {
+                anyhow::bail!("Duplicate speaker name: '{}'", speaker.name);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get a preset layout by name
+    pub fn preset(name: &str) -> Result<Self> {
+        match name {
+            "stereo" => Self::preset_stereo(),
+            "5.1" => Self::preset_5_1(),
+            "7.1" => Self::preset_7_1(),
+            "7.1.4" => Self::preset_7_1_4(),
+            "9.1.6" => Self::preset_9_1_6(),
+            "cascade-12" => Self::preset_cascade_12(),
+            _ => anyhow::bail!(
+                "Unknown preset layout: '{}'. Available: stereo, 5.1, 7.1, 7.1.4, 9.1.6, cascade-12",
+                name
+            ),
+        }
+    }
+
+    /// ITU-R BS.775 stereo layout (±30°)
+    pub fn preset_stereo() -> Result<Self> {
+        Self::from_speakers(vec![
+            speaker_with_distance("L", -26.565052, 0.0, 2.236068),
+            speaker_with_distance("R", 26.565052, 0.0, 2.236068),
+            Speaker::new("Top", 0.0, 90.0), // Dummy for 3D triangulation
+        ])
+    }
+
+    /// ITU-R BS.775 5.1 layout
+    pub fn preset_5_1() -> Result<Self> {
+        Self::from_speakers(vec![
+            speaker_with_distance("FL", -26.565052, 0.0, 2.236068),
+            speaker_with_distance("FR", 26.565052, 0.0, 2.236068),
+            speaker_with_distance("C", 0.0, 0.0, 2.0),
+            speaker_with_distance("LFE", 26.565052, -12.6043825, 2.291288),
+            speaker_with_distance("BL", -153.43495, 0.0, 2.236068),
+            speaker_with_distance("BR", 153.43495, 0.0, 2.236068),
+        ])
+    }
+
+    /// ITU-R BS.775 7.1 layout
+    pub fn preset_7_1() -> Result<Self> {
+        Self::from_speakers(vec![
+            speaker_with_distance("FL", -26.565052, 0.0, 2.236068),
+            speaker_with_distance("FR", 26.565052, 0.0, 2.236068),
+            speaker_with_distance("C", 0.0, 0.0, 2.0),
+            speaker_with_distance("LFE", 26.565052, -12.6043825, 2.291288),
+            speaker_with_distance("BL", -153.43495, 0.0, 2.236068),
+            speaker_with_distance("BR", 153.43495, 0.0, 2.236068),
+            speaker_with_distance("SL", -90.0, 0.0, 1.0),
+            speaker_with_distance("SR", 90.0, 0.0, 1.0),
+        ])
+    }
+
+    /// 7.1.4 spatial audio layout, the renderer's default when no layout is
+    /// configured. Kept byte-for-byte in sync with `layouts/7.1.4.yaml` (the
+    /// "omniphony (live)" default) in normalised cartesian coordinates — see
+    /// `preset_7_1_4_matches_bundled_yaml`.
+    pub fn preset_7_1_4() -> Result<Self> {
+        Self::from_speakers(vec![
+            // Bed layer (7.1)
+            Speaker::from_cartesian("FL", -1.0, 1.0, 0.0, true, 0.0),
+            Speaker::from_cartesian("FR", 1.0, 1.0, 0.0, true, 0.0),
+            Speaker::from_cartesian("C", 0.0, 1.0, 0.0, true, 0.0),
+            Speaker::from_cartesian("LFE", 1.0, 1.0, -1.0, false, 0.0),
+            Speaker::from_cartesian("BL", -1.0, -1.0, 0.0, true, 0.0),
+            Speaker::from_cartesian("BR", 1.0, -1.0, 0.0, true, 0.0),
+            Speaker::from_cartesian("SL", -1.0, 0.0, 0.0, true, 0.0),
+            Speaker::from_cartesian("SR", 1.0, 0.0, 0.0, true, 0.0),
+            // Height layer
+            Speaker::from_cartesian("TFL", -1.0, 1.0, 1.0, true, 0.0),
+            Speaker::from_cartesian("TFR", 1.0, 1.0, 1.0, true, 0.0),
+            Speaker::from_cartesian("TBL", -1.0, -1.0, 1.0, true, 0.0),
+            Speaker::from_cartesian("TBR", 1.0, -1.0, 1.0, true, 0.0),
+        ])
+    }
+
+    /// Virtual layout for the cascaded binaural mode (issue #220): a closed 3D
+    /// shell of 12 spatialized speakers around the listener — 8 on the ear
+    /// plane (45° spacing, where most content lives) and 4 at 45° elevation.
+    /// The zenith is covered by the panner's virtual-pole downmix onto the
+    /// height ring. The LFE entry (`spatialize: false`) receives one-hot
+    /// LFE-routed channels exactly like a physical room; the binaural stage
+    /// then feeds it to both ears dry (its direct-channel policy).
+    pub fn preset_cascade_12() -> Result<Self> {
+        Self::from_speakers(vec![
+            // Ear-plane ring (8), 45° spacing.
+            Speaker::new("C", 0.0, 0.0),
+            Speaker::new_with_spatialize("LFE", 45.0, -10.0, false),
+            Speaker::new("FL", -45.0, 0.0),
+            Speaker::new("FR", 45.0, 0.0),
+            Speaker::new("SL", -90.0, 0.0),
+            Speaker::new("SR", 90.0, 0.0),
+            Speaker::new("BL", -135.0, 0.0),
+            Speaker::new("BR", 135.0, 0.0),
+            Speaker::new("B", 180.0, 0.0),
+            // Height ring (4) at 45° elevation.
+            Speaker::new("TFL", -45.0, 45.0),
+            Speaker::new("TFR", 45.0, 45.0),
+            Speaker::new("TBL", -135.0, 45.0),
+            Speaker::new("TBR", 135.0, 45.0),
+        ])
+    }
+
+    /// 9.1.6 spatial audio layout (ITU-R BS.2051-3 Config 6+4+0)
+    pub fn preset_9_1_6() -> Result<Self> {
+        Self::from_speakers(vec![
+            // Bed layer (9.1)
+            speaker_with_distance("FL", -26.565052, 0.0, 2.236068),
+            speaker_with_distance("FR", 26.565052, 0.0, 2.236068),
+            speaker_with_distance("C", 0.0, 0.0, 2.0),
+            speaker_with_distance("LFE", 26.565052, -12.6043825, 2.291288),
+            speaker_with_distance("BL", -153.43495, 0.0, 2.236068),
+            speaker_with_distance("BR", 153.43495, 0.0, 2.236068),
+            speaker_with_distance("SL", -90.0, 0.0, 1.0),
+            speaker_with_distance("SR", 90.0, 0.0, 1.0),
+            speaker_with_distance("FWL", -63.43495, 0.0, 1.118034),
+            speaker_with_distance("FWR", 63.43495, 0.0, 1.118034),
+            // Height layer (6 speakers)
+            speaker_with_distance("TFL", -45.0, 35.26439, 1.7320508),
+            speaker_with_distance("TFR", 45.0, 35.26439, 1.7320508),
+            speaker_with_distance("TSL", -90.0, 45.0, 1.4142136),
+            speaker_with_distance("TSR", 90.0, 45.0, 1.4142136),
+            speaker_with_distance("TBL", -135.0, 35.26439, 1.7320508),
+            speaker_with_distance("TBR", 135.0, 35.26439, 1.7320508),
+        ])
+    }
+
+    /// Save layout to YAML file
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let file = File::create(path)
+            .with_context(|| format!("Failed to create file: {}", path.display()))?;
+
+        serde_yaml_ng::to_writer(file, self)
+            .with_context(|| format!("Failed to write YAML: {}", path.display()))?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_entries_accept_a_partial_set_and_reject_duplicates() {
+        // One channel is a legitimate set of entries: only its trim and
+        // routing are meant, the rest of the channels keep their defaults.
+        let one = SpeakerLayout::entries_from_yaml_str(
+            "speakers:\n  - { name: LFE, coord_mode: cartesian, x: 0, y: 1, z: 0, spatialize: false, gain_db: -6 }\n",
+        )
+        .expect("one entry parses");
+        assert_eq!(one.speakers.len(), 1);
+        assert!(!one.speakers[0].spatialize);
+        assert!(
+            SpeakerLayout::from_yaml_str(
+                "speakers:\n  - { name: LFE, coord_mode: cartesian, x: 0, y: 1, z: 0 }\n"
+            )
+            .is_err(),
+            "an output layout still needs its VBAP minimum"
+        );
+        assert!(SpeakerLayout::entries_from_yaml_str("speakers: []\n").is_ok());
+        assert!(
+            SpeakerLayout::entries_from_yaml_str(
+                "speakers:\n  - { name: Ls, coord_mode: polar, azimuth: -110, elevation: 0, distance: 1 }\n  - { name: Ls, coord_mode: polar, azimuth: -90, elevation: 0, distance: 1 }\n"
+            )
+            .is_err(),
+            "the same channel twice is a mistake, not a choice"
+        );
+    }
+
+    #[test]
+    fn label_mapping_accepts_every_legacy_alias() {
+        // Parity net kept from the bed-id era: every spelling the historical
+        // alias table accepted must still resolve, now to its channel label.
+        use bridge_api::RChannelLabel as L;
+        let legacy: [(L, &[&str]); 10] = [
+            (L::L, &["L", "FL", "FrontLeft", "LeftFront"]),
+            (L::R, &["R", "FR", "FrontRight", "RightFront"]),
+            (L::C, &["C", "FC", "Center", "Centre"]),
+            (L::LFE, &["LFE", "Sub", "Subwoofer", "SW"]),
+            (L::Ls, &["Ls", "SL", "LeftSurround", "SurroundLeft"]),
+            (L::Rs, &["Rs", "SR", "RightSurround", "SurroundRight"]),
+            (
+                L::Lb,
+                &[
+                    "Lb", "BL", "Lrs", "BackLeft", "LeftBack", "RearLeft", "LeftRear",
+                ],
+            ),
+            (
+                L::Rb,
+                &[
+                    "Rb",
+                    "BR",
+                    "Rrs",
+                    "BackRight",
+                    "RightBack",
+                    "RearRight",
+                    "RightRear",
+                ],
+            ),
+            (
+                L::Tfl,
+                &[
+                    "Ltf",
+                    "TFL",
+                    "TopFrontLeft",
+                    "LeftTopFront",
+                    "HeightLeft",
+                    "HL",
+                ],
+            ),
+            (
+                L::Tfr,
+                &[
+                    "Rtf",
+                    "TFR",
+                    "TopFrontRight",
+                    "RightTopFront",
+                    "HeightRight",
+                    "HR",
+                ],
+            ),
+        ];
+        for (label, aliases) in legacy {
+            for alias in aliases {
+                let layout = SpeakerLayout::from_speakers(vec![
+                    Speaker::new("A", -30.0, 0.0),
+                    Speaker::new(*alias, 30.0, 0.0),
+                    Speaker::new("B", 110.0, 0.0),
+                ])
+                .expect("parity layout");
+                let mapping = layout.label_to_speaker_mapping();
+                assert_eq!(
+                    mapping.get(&label),
+                    Some(&1),
+                    "legacy alias {alias:?} no longer maps to {label:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn label_mapping_first_matching_speaker_wins() {
+        let layout = SpeakerLayout::from_speakers(vec![
+            Speaker::new("FL", -30.0, 0.0),
+            Speaker::new("FrontLeft", -31.0, 0.0),
+            Speaker::new("FR", 30.0, 0.0),
+        ])
+        .expect("dup layout");
+        assert_eq!(
+            layout
+                .label_to_speaker_mapping()
+                .get(&bridge_api::RChannelLabel::L),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn test_speaker_creation() {
+        let speaker = Speaker::new("FL", -30.0, 0.0);
+        assert_eq!(speaker.name, "FL");
+        assert_eq!(speaker.azimuth, -30.0);
+        assert_eq!(speaker.elevation, 0.0);
+        assert!(speaker.validate().is_ok());
+    }
+
+    #[test]
+    fn test_speaker_validation() {
+        // Valid speaker
+        assert!(Speaker::new("FL", -30.0, 0.0).validate().is_ok());
+
+        // Invalid azimuth
+        assert!(Speaker::new("FL", -200.0, 0.0).validate().is_err());
+        assert!(Speaker::new("FL", 200.0, 0.0).validate().is_err());
+
+        // Invalid elevation
+        assert!(Speaker::new("FL", 0.0, -100.0).validate().is_err());
+        assert!(Speaker::new("FL", 0.0, 100.0).validate().is_err());
+    }
+
+    #[test]
+    fn test_layout_validation() {
+        // Valid layout
+        let layout = SpeakerLayout::from_speakers(vec![
+            Speaker::new("FL", -30.0, 0.0),
+            Speaker::new("FR", 30.0, 0.0),
+            Speaker::new("C", 0.0, 0.0),
+        ]);
+        assert!(layout.is_ok());
+
+        // Too few speakers
+        let layout = SpeakerLayout::from_speakers(vec![
+            Speaker::new("FL", -30.0, 0.0),
+            Speaker::new("FR", 30.0, 0.0),
+        ]);
+        assert!(layout.is_err());
+
+        // Duplicate names
+        let layout = SpeakerLayout::from_speakers(vec![
+            Speaker::new("FL", -30.0, 0.0),
+            Speaker::new("FL", 30.0, 0.0),
+            Speaker::new("C", 0.0, 0.0),
+        ]);
+        assert!(layout.is_err());
+    }
+
+    #[test]
+    fn test_preset_layouts() {
+        // Test all presets load successfully
+        assert!(SpeakerLayout::preset("stereo").is_ok());
+        assert!(SpeakerLayout::preset("5.1").is_ok());
+        assert!(SpeakerLayout::preset("7.1").is_ok());
+        assert!(SpeakerLayout::preset("7.1.4").is_ok());
+        assert!(SpeakerLayout::preset("9.1.6").is_ok());
+
+        // Test invalid preset
+        assert!(SpeakerLayout::preset("invalid").is_err());
+    }
+
+    #[test]
+    fn test_7_1_4_layout() {
+        let layout = SpeakerLayout::preset("7.1.4").unwrap();
+        assert_eq!(layout.num_speakers(), 12);
+
+        // The preset mirrors layouts/7.1.4.yaml (normalised cartesian).
+        let fl = &layout.speakers[0];
+        assert_eq!(fl.name, "FL");
+        assert_eq!(fl.coord_mode, "cartesian");
+        assert_eq!([fl.x, fl.y, fl.z], [-1.0, 1.0, 0.0]);
+
+        let tfl = &layout.speakers[8];
+        assert_eq!(tfl.name, "TFL");
+        assert_eq!([tfl.x, tfl.y, tfl.z], [-1.0, 1.0, 1.0]);
+
+        // LFE stays non-spatialized.
+        assert!(!layout.speakers[3].spatialize);
+    }
+
+    #[test]
+    fn test_positions_extraction() {
+        let layout = SpeakerLayout::preset("5.1").unwrap();
+        let positions = layout.positions();
+
+        assert_eq!(positions.len(), 6);
+        assert_eq!(positions[0], [-26.565052, 0.0]); // FL
+        assert_eq!(positions[1], [26.565052, 0.0]); // FR
+        assert_eq!(positions[2], [0.0, 0.0]); // C
+    }
+
+    #[test]
+    fn test_speaker_names() {
+        let layout = SpeakerLayout::preset("stereo").unwrap();
+        let names = layout.speaker_names();
+
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[0], "L");
+        assert_eq!(names[1], "R");
+        assert_eq!(names[2], "Top");
+    }
+}
+#[cfg(test)]
+mod integration_tests {
+    use crate::speaker_layout::SpeakerLayout;
+    use std::path::PathBuf;
+
+    fn layout_path(name: &str) -> PathBuf {
+        // CARGO_MANIFEST_DIR is the `renderer` crate dir
+        // (`<repo>/omniphony-renderer/renderer`); the shipped layouts live at
+        // the repo root (`<repo>/layouts`), so climb two levels up.
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("layouts")
+            .join(name)
+    }
+
+    #[test]
+    fn test_load_5_1_yaml() {
+        // The height-less layouts now live under layouts/legacy/.
+        let layout = SpeakerLayout::from_file(layout_path("legacy/5.1.yaml"));
+        assert!(
+            layout.is_ok(),
+            "Failed to load legacy/5.1.yaml: {:?}",
+            layout.err()
+        );
+
+        let layout = layout.unwrap();
+        assert_eq!(layout.num_speakers(), 6);
+    }
+
+    #[test]
+    fn test_load_7_1_4_yaml() {
+        let layout = SpeakerLayout::from_file(layout_path("7.1.4.yaml"));
+        assert!(
+            layout.is_ok(),
+            "Failed to load 7.1.4.yaml: {:?}",
+            layout.err()
+        );
+
+        let layout = layout.unwrap();
+        assert_eq!(layout.num_speakers(), 12);
+    }
+
+    #[test]
+    fn preset_7_1_4_matches_bundled_yaml() {
+        // The default fallback layout (`SpeakerLayout::preset("7.1.4")`, used by
+        // bootstrap/degraded/engine when no layout is configured) must stay in
+        // sync with the shipped `layouts/7.1.4.yaml` ("omniphony (live)").
+        let preset = SpeakerLayout::preset("7.1.4").expect("7.1.4 preset");
+        let yaml = SpeakerLayout::from_file(layout_path("7.1.4.yaml")).expect("load 7.1.4.yaml");
+
+        assert_eq!(preset.speakers.len(), yaml.speakers.len());
+        for (p, y) in preset.speakers.iter().zip(&yaml.speakers) {
+            assert_eq!(p.name, y.name, "speaker order/name mismatch");
+            assert_eq!(p.coord_mode, y.coord_mode, "{} coord_mode mismatch", p.name);
+            assert_eq!(p.spatialize, y.spatialize, "{} spatialize mismatch", p.name);
+            assert!(
+                (p.x - y.x).abs() < 1e-6 && (p.y - y.y).abs() < 1e-6 && (p.z - y.z).abs() < 1e-6,
+                "{} cartesian mismatch: preset {:?} vs yaml {:?}",
+                p.name,
+                (p.x, p.y, p.z),
+                (y.x, y.y, y.z)
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_9_1_6_yaml() {
+        let layout = SpeakerLayout::from_file(layout_path("9.1.6.yaml"));
+        assert!(
+            layout.is_ok(),
+            "Failed to load 9.1.6.yaml: {:?}",
+            layout.err()
+        );
+
+        let layout = layout.unwrap();
+        assert_eq!(layout.num_speakers(), 16);
+    }
+}

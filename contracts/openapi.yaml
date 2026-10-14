@@ -1,0 +1,1134 @@
+openapi: 3.1.0
+info:
+  title: mpv-webd control API
+  version: 1.0.0
+servers:
+- url: http://127.0.0.1:8765
+paths:
+  /api/v1/health/live:
+    get:
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/v1/health/ready:
+    get:
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/v1/player/state:
+    get:
+      responses:
+        '200':
+          description: Authoritative current player snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlayerStateResponse'
+  /api/v1/media/browse:
+    get:
+      summary: Browse configured server-side media roots
+      description: Lists only regular files and directories whose canonical paths remain inside configured
+        local media roots. An omitted directory lists configured roots; search filters the current directory
+        only. Network URLs and arbitrary browser-local paths are not browse targets.
+      parameters:
+      - name: directory
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 4096
+          - type: 'null'
+          title: Directory
+      - name: search
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 128
+          default: ''
+          title: Search
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 200
+          minimum: 1
+          default: 100
+          title: Limit
+      - name: offset
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+          title: Offset
+      - name: version
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            maxLength: 64
+          - type: 'null'
+          title: Version
+      - name: sort
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^(name|name_desc|modified)$
+          default: name
+          title: Sort
+      - name: details
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: true
+          title: Details
+      responses:
+        '200':
+          description: Bounded media-directory listing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaBrowserResponse'
+        '403':
+          description: No configured roots or directory outside the local allowlist
+  /api/v1/media/metadata:
+    get:
+      summary: Describe one configured media item with bounded metadata
+      description: Returns evidence-backed short codec and dynamic-range labels plus the selected bounded
+        preview source. Unknown metadata remains explicitly Unknown.
+      parameters:
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          title: Path
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MediaMetadataResponse'
+        '403':
+          description: Media item is outside the local allowlist
+        '404':
+          description: Media metadata is unavailable
+  /api/v1/media/preview:
+    get:
+      summary: Serve a bounded media preview for one configured media item
+      parameters:
+      - name: path
+        in: query
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          title: Path
+      responses:
+        '200':
+          description: Embedded art, sibling art, representative video frame, or a safe placeholder
+          content:
+            image/jpeg: {}
+            image/png: {}
+            image/svg+xml: {}
+            image/webp: {}
+        '403':
+          description: Media item or preview is outside the local allowlist
+        '404':
+          description: The media item is unavailable
+  /api/v1/player/load:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoadRequest'
+      responses:
+        '202':
+          description: Load accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/play:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      responses:
+        '200':
+          description: Play requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/pause:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      responses:
+        '200':
+          description: Pause requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/seek:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SeekRequest'
+      responses:
+        '200':
+          description: Seek accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/stop:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      responses:
+        '200':
+          description: Stop requested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/volume:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValueRequest'
+      responses:
+        '200':
+          description: Volume accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/speed:
+    post:
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          type: string
+          nullable: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValueRequest'
+      responses:
+        '200':
+          description: Speed accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/tracks:
+    get:
+      responses:
+        '200':
+          description: Normalized current track list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Track'
+  /api/v1/player/tracks/{track_id}/select:
+    post:
+      parameters:
+      - name: track_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrackSelectRequest'
+      responses:
+        '200':
+          description: Track selection accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandResponse'
+  /api/v1/player/chapters:
+    get:
+      responses:
+        '200':
+          description: Current chapter list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Chapter'
+  /api/v1/queue:
+    get:
+      responses:
+        '200':
+          description: Current queue and revision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueResponse'
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueueAddRequest'
+      responses:
+        '201':
+          description: Queue item added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueItem'
+    delete:
+      parameters:
+      - name: expected_revision
+        in: query
+        required: false
+        schema:
+          type: integer
+          nullable: true
+          minimum: 0
+      responses:
+        '200':
+          description: Queue cleared
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueResponse'
+  /api/v1/queue/items/{item_id}:
+    delete:
+      parameters:
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: expected_revision
+        in: query
+        required: false
+        schema:
+          type: integer
+          nullable: true
+          minimum: 0
+      responses:
+        '200':
+          description: Queue item removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueResponse'
+    patch:
+      parameters:
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueueMoveRequest'
+      responses:
+        '200':
+          description: Queue item moved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueResponse'
+  /api/v1/queue/items/{item_id}/activate:
+    post:
+      parameters:
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueueRevisionRequest'
+      responses:
+        '200':
+          description: Queue item activated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueResponse'
+  /api/v1/outputs:
+    get:
+      responses:
+        '200':
+          description: Read-only reported output devices
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutputInventoryResponse'
+  /api/v1/profiles:
+    get:
+      responses:
+        '200':
+          description: Validated compatibility settings and observed hardware-bound output IDs; unavailable
+            retained devices are disabled
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Profile'
+  /api/v1/profiles/apply:
+    post:
+      summary: Apply and resolve a profile selection
+      description: Accept profile IDs and catalog-validated typed overrides. Hardware output IDs resolve
+        only through fresh reported devices and exact trusted routes. Stale outputs are rejected before
+        player actions. Controlled restarts preserve unselected active output routes and require readback
+        for all preserved routes. Backend and render-context profiles retain their compatibility IDs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileApplyRequest'
+      responses:
+        '200':
+          description: Effective profile selection
+          observed runtime values: null
+          and restart-pending settings: null
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileApplyResponse'
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      properties:
+        status:
+          type: string
+        service:
+          type: string
+          default: mpv-webd
+    CommandResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        accepted:
+          type: boolean
+          default: true
+        request_id:
+          type: string
+          nullable: true
+    LoadRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - path
+      properties:
+        path:
+          type: string
+          minLength: 1
+        request_key:
+          type: string
+          nullable: true
+          minLength: 1
+    SeekRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - seconds
+      properties:
+        seconds:
+          type: number
+          description: Finite seek value; non-negative target when relative is false, signed offset when
+            relative is true.
+        relative:
+          type: boolean
+          default: false
+        request_key:
+          type: string
+          nullable: true
+          minLength: 1
+    ValueRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - value
+      properties:
+        value:
+          type: number
+        request_key:
+          type: string
+          nullable: true
+          minLength: 1
+    PlayerStateResponse:
+      properties:
+        player_id:
+          type: string
+          title: Player Id
+        session_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Session Id
+        status:
+          type: string
+          title: Status
+        position:
+          anyOf:
+          - type: number
+            minimum: 0.0
+          - type: 'null'
+          title: Position
+        duration:
+          anyOf:
+          - type: number
+            minimum: 0.0
+          - type: 'null'
+          title: Duration
+        seekable:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Seekable
+        path:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Path
+        volume:
+          anyOf:
+          - type: number
+            maximum: 100.0
+            minimum: 0.0
+          - type: 'null'
+          title: Volume
+        speed:
+          anyOf:
+          - type: number
+            exclusiveMinimum: 0.0
+          - type: 'null'
+          title: Speed
+        pause:
+          type: boolean
+          title: Pause
+          default: false
+      additionalProperties: false
+      type: object
+      required:
+      - player_id
+      - status
+      title: PlayerStateResponse
+    MediaPresentation:
+      type: object
+      additionalProperties: false
+      description: Short, shared labels safe for every visible media-information surface.
+      properties:
+        hdr_format:
+          type: string
+          default: Unknown
+          title: Hdr Format
+        hdr_compatibility:
+          type: array
+          items:
+            type: string
+          title: Hdr Compatibility
+        audio_formats:
+          type: array
+          items:
+            type: string
+          title: Audio Formats
+        video_codec:
+          type: string
+          default: Unknown
+          title: Video Codec
+      title: MediaPresentation
+    MediaBrowserItem:
+      type: object
+      additionalProperties: false
+      required:
+      - name
+      - path
+      - is_directory
+      properties:
+        name:
+          type: string
+          title: Name
+        path:
+          type: string
+          title: Path
+        is_directory:
+          type: boolean
+          title: Is Directory
+        size_bytes:
+          anyOf:
+          - type: integer
+            minimum: 0.0
+          - type: 'null'
+          title: Size Bytes
+        modified_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Modified At
+        media_kind:
+          type: string
+          enum:
+          - directory
+          - audio
+          - video
+          default: directory
+          title: Media Kind
+        has_preview:
+          type: boolean
+          default: false
+          title: Has Preview
+        preview_kind:
+          type: string
+          enum:
+          - embedded_art
+          - sibling_art
+          - video_frame
+          - placeholder
+          - none
+          default: none
+          title: Preview Kind
+        presentation:
+          $ref: '#/components/schemas/MediaPresentation'
+      title: MediaBrowserItem
+    MediaMetadataResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        path:
+          type: string
+          title: Path
+        preview_kind:
+          type: string
+          enum:
+          - embedded_art
+          - sibling_art
+          - video_frame
+          - placeholder
+          - none
+          default: none
+          title: Preview Kind
+        has_preview:
+          type: boolean
+          default: true
+          title: Has Preview
+        presentation:
+          $ref: '#/components/schemas/MediaPresentation'
+      required:
+      - path
+      title: MediaMetadataResponse
+    MediaBrowserResponse:
+      properties:
+        directory:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Directory
+        parent_directory:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Directory
+        items:
+          items:
+            $ref: '#/components/schemas/MediaBrowserItem'
+          type: array
+          title: Items
+        truncated:
+          type: boolean
+          title: Truncated
+          default: false
+        total:
+          type: integer
+          title: Total
+          default: 0
+        total_files:
+          type: integer
+          title: Total Files
+          default: 0
+        offset:
+          type: integer
+          title: Offset
+          default: 0
+        next_offset:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Next Offset
+        version:
+          type: string
+          title: Version
+          default: ''
+      additionalProperties: false
+      type: object
+      title: MediaBrowserResponse
+    Track:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - type
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+        title:
+          type: string
+          nullable: true
+        language:
+          type: string
+          nullable: true
+        codec:
+          type: string
+          nullable: true
+        selected:
+          type: boolean
+          default: false
+    TrackSelectRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - type
+      properties:
+        type:
+          type: string
+          enum:
+          - audio
+          - sub
+          - video
+        request_key:
+          type: string
+          nullable: true
+          minLength: 1
+    Chapter:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - time
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+          nullable: true
+        time:
+          type: number
+          minimum: 0
+    QueueItem:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - path
+      - ordinal
+      properties:
+        id:
+          type: string
+        path:
+          type: string
+        ordinal:
+          type: integer
+          minimum: 0
+        active:
+          type: boolean
+          default: false
+    QueueAddRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - path
+      properties:
+        path:
+          type: string
+          minLength: 1
+        ordinal:
+          type: integer
+          nullable: true
+          minimum: 0
+        expected_revision:
+          type: integer
+          nullable: true
+          minimum: 0
+    QueueRevisionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        expected_revision:
+          type: integer
+          nullable: true
+          minimum: 0
+    QueueMoveRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - ordinal
+      properties:
+        expected_revision:
+          type: integer
+          nullable: true
+          minimum: 0
+        ordinal:
+          type: integer
+          minimum: 0
+    QueueResponse:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          type: string
+          title: Name
+        revision:
+          type: integer
+          minimum: 0.0
+          title: Revision
+        items:
+          items:
+            $ref: '#/components/schemas/QueueItem'
+          type: array
+          title: Items
+        playback:
+          anyOf:
+          - $ref: '#/components/schemas/QueuePlaybackStatus'
+          - type: 'null'
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - name
+      - revision
+      title: QueueResponse
+    OutputDevice:
+      properties:
+        id:
+          type: string
+          title: Id
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        method:
+          type: string
+          enum:
+          - ALSA
+          - PipeWire
+          - DRM
+          title: Method
+        route:
+          type: string
+          title: Route
+        kind:
+          type: string
+          enum:
+          - audio_device
+          - audio_sink
+          - display_connector
+          title: Kind
+        profile_ids:
+          items:
+            type: string
+          type: array
+          title: Profile Ids
+      additionalProperties: false
+      type: object
+      required:
+      - id
+      - method
+      - route
+      - kind
+      title: OutputDevice
+    OutputInventoryResponse:
+      properties:
+        devices:
+          items:
+            $ref: '#/components/schemas/OutputDevice'
+          type: array
+          title: Devices
+        unavailable:
+          items:
+            type: string
+          type: array
+          title: Unavailable
+      additionalProperties: false
+      type: object
+      required:
+      - devices
+      title: OutputInventoryResponse
+    Profile:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - name
+      - category
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        category:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        kind:
+          type: string
+          enum:
+          - profile
+          - backend
+          - device
+          - no_output
+          - decoder
+          - render_context
+          default: profile
+        route:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+        device_reported:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: null
+    ProfileApplyRequest:
+      type: object
+      title: ProfileApplyRequest
+      description: A profile-ID selection plus JSON scalar overrides, never raw mpv input.
+      additionalProperties: false
+      required:
+      - profile_ids
+      properties:
+        profile_ids:
+          title: Profile Ids
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          items:
+            type: string
+        overrides:
+          title: Overrides
+          type: object
+          maxProperties: 32
+          additionalProperties: true
+        force_restart:
+          title: Force Restart
+          type: boolean
+          default: false
+          description: Explicitly rebuild the managed host while idle, preserving its live options and
+            snapshot.
+        request_key:
+          title: Request Key
+          anyOf:
+          - type: string
+            minLength: 1
+            maxLength: 128
+          - type: 'null'
+    ProfileApplyConflict:
+      type: object
+      title: ProfileApplyConflict
+      additionalProperties: false
+      required:
+      - option
+      - previous_profile_id
+      - winning_profile_id
+      - previous_category
+      - winning_category
+      - previous_value
+      - winning_value
+      properties:
+        option:
+          title: Option
+          type: string
+        previous_profile_id:
+          title: Previous Profile Id
+          type: string
+        winning_profile_id:
+          title: Winning Profile Id
+          type: string
+        previous_category:
+          title: Previous Category
+          type: string
+        winning_category:
+          title: Winning Category
+          type: string
+        previous_value:
+          title: Previous Value
+        winning_value:
+          title: Winning Value
+    ProfileApplyResponse:
+      type: object
+      title: ProfileApplyResponse
+      description: Effective options, observed runtime values, and restart-pending settings.
+      additionalProperties: false
+      required:
+      - profile_ids
+      - effective_options
+      - sources
+      - conflicts
+      - observed_options
+      - pending_restart_options
+      properties:
+        accepted:
+          title: Accepted
+          type: boolean
+          default: true
+        applied:
+          title: Applied
+          type: boolean
+          default: false
+        profile_ids:
+          title: Profile Ids
+          type: array
+          items:
+            type: string
+        effective_options:
+          title: Effective Options
+          type: object
+          additionalProperties: true
+        sources:
+          title: Sources
+          type: object
+          additionalProperties:
+            type: string
+        conflicts:
+          title: Conflicts
+          type: array
+          items:
+            $ref: '#/components/schemas/ProfileApplyConflict'
+        observed_options:
+          title: Observed Options
+          type: object
+          additionalProperties: true
+        pending_restart_options:
+          title: Pending Restart Options
+          type: object
+          additionalProperties: true
+    QueuePlaybackStatus:
+      properties:
+        intent_id:
+          type: integer
+          exclusiveMinimum: 0.0
+          title: Intent Id
+        item_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Item Id
+        phase:
+          type: string
+          enum:
+          - prepared
+          - submitted
+          - confirmed
+          - failed
+          - uncertain
+          - superseded
+          - removed
+          - cancelled
+          title: Phase
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
+      additionalProperties: false
+      type: object
+      required:
+      - intent_id
+      - item_id
+      - phase
+      - detail
+      title: QueuePlaybackStatus

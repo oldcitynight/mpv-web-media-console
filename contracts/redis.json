@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "namespace": "mpvweb:v1",
+  "keys": {
+    "player_state": "mpvweb:v1:state:player:{player_id}",
+    "session_state": "mpvweb:v1:state:session:{session_id}",
+    "events_stream": "mpvweb:v1:stream:events:{player_id}",
+    "live_pubsub": "mpvweb:v1:pub:events:{player_id}",
+    "player_lease": "mpvweb:v1:lease:player:{player_id}",
+    "idempotency": "mpvweb:v1:idem:{client_id}:{key}"
+  },
+  "component_encoding": {
+    "player_id": "ASCII [A-Za-z0-9_.-], 1-128 characters",
+    "session_id": "ASCII [A-Za-z0-9_.-], 1-128 characters",
+    "client_id": "lowercase SHA-256 hex of the stable opaque client identity",
+    "key": "lowercase SHA-256 hex of the raw idempotency key"
+  },
+  "retention": {
+    "player_state_ttl_seconds": 300,
+    "session_state_ttl_seconds": 300,
+    "events_stream_max_length": 10000,
+    "live_pubsub": "non-persistent channel; consumers recover from the stream or SQLite",
+    "player_lease_ttl_seconds": 15,
+    "player_lease_renew_interval_seconds": 5,
+    "idempotency_ttl_seconds": 86400
+  },
+  "rules": [
+    "Every key and channel is scoped under mpvweb:v1; never issue unprefixed application keys.",
+    "Redis never contains the only durable copy of queue, resume, history, profile, auth, or media facts.",
+    "All ephemeral state keys have a documented TTL or bounded stream policy.",
+    "Player leases use unique holder tokens and token-checked renewal/release.",
+    "Pub/Sub is low-latency fanout only; recovery must not depend on it."
+  ]
+}

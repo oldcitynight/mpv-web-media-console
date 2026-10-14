@@ -1,0 +1,38 @@
+{
+  "name": "mpv-helper-web",
+  "private": true,
+  "client": "browser-only",
+  "framework": {
+    "name": "Vue",
+    "major": 3
+  },
+  "bundler": "Vite",
+  "language": "TypeScript",
+  "componentPolicy": "Project-owned lightweight components; adapt approved donor interaction patterns only.",
+  "backendIntegration": {
+    "commands": "Typed REST operations",
+    "canonicalState": "Authenticated WebSocket snapshots and ordered events",
+    "forbiddenSurfaces": ["generic command endpoint", "raw mpv property endpoint", "arbitrary IPC"]
+  },
+  "navigation": {
+    "default": "remote",
+    "items": ["remote", "library", "queue", "info"]
+  },
+  "donors": [
+    {
+      "repository": "https://github.com/husudosu/mpv-remote-app",
+      "commit": "11ed193a06c53161a7f4bd368ede4feab19827e5",
+      "license": "MIT",
+      "use": "Primary mobile-controller interaction reference; attribution required.",
+      "exclude": ["polling/server architecture", "Capacitor wrapper", "full app structure"]
+    },
+    {
+      "repository": "https://github.com/open-dynaMIX/simple-mpv-webui",
+      "commit": "3c753450dd827d11eb6b6b8ff926e55af850478d",
+      "license": "MIT",
+      "use": "Touch-seek and Media Session behavior only; attribution required.",
+      "exclude": ["generic arbitrary-property API", "server/polling architecture"]
+    }
+  ],
+  "copiedUpstreamFiles": []
+}

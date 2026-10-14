@@ -1,0 +1,197 @@
+--- a/omniphony-renderer/reference_bridge/src/bridge.rs
++++ b/omniphony-renderer/reference_bridge/src/bridge.rs
+@@ -41,6 +41,10 @@
+     labels: Vec<RChannelLabel>,
+     strict: bool,
+     frames_emitted: u64,
++    finite_validation: bool,
++    input_failed: bool,
++    input_bytes: u64,
++    riff_bytes: Option<u64>,
+ }
+ 
+ impl WavBridge {
+@@ -51,6 +55,10 @@
+             labels: Vec::new(),
+             strict,
+             frames_emitted: 0,
++            finite_validation: false,
++            input_failed: false,
++            input_bytes: 0,
++            riff_bytes: None,
+         }
+     }
+ 
+@@ -58,6 +66,9 @@
+         self.buf.clear();
+         self.state = State::Header;
+         self.labels.clear();
++        self.input_failed = false;
++        self.input_bytes = 0;
++        self.riff_bytes = None;
+     }
+ 
+     /// Emit one error into `result`, resetting the parser. In strict mode the
+@@ -65,8 +76,9 @@
+     fn fail(&mut self, result: &mut RPushResult, message: &str) {
+         bridge_diag_log(log::Level::Warn, message);
+         self.reset_state();
++        self.input_failed = true;
+         result.did_reset = true;
+-        if self.strict {
++        if self.strict || self.finite_validation {
+             result.error_message = RString::from(message);
+         }
+     }
+@@ -86,6 +98,19 @@
+                 data_offset,
+                 data_len,
+             } => {
++                let riff_size = u32::from_le_bytes(self.buf[4..8].try_into().unwrap());
++                self.riff_bytes = if riff_size == 0 || riff_size == u32::MAX {
++                    None
++                } else {
++                    Some(u64::from(riff_size) + 8)
++                };
++                if self.finite_validation && self.riff_bytes.is_some_and(|end| {
++                    end < data_offset as u64
++                        || (data_len != u64::MAX && end < data_offset as u64 + data_len)
++                }) {
++                    self.fail(result, "reference-bridge: WAV data exceeds the RIFF container");
++                    return false;
++                }
+                 self.labels = channel_labels(format.channels);
+                 self.buf.drain(0..data_offset);
+                 bridge_diag_log(
+@@ -101,6 +126,33 @@
+                 };
+                 true
+             }
++        }
++    }
++
++    /// Validate only a negotiated finite EOF, never a cancellation or live-stream reset.
++    fn finish_finite_input(&self) -> bool {
++        let reason = if self.input_failed {
++            Some("invalid WAV input")
++        } else if matches!(self.state, State::Header) {
++            Some("incomplete WAV header at EOF")
++        } else if self.riff_bytes.is_some_and(|size| self.input_bytes < size) {
++            Some("truncated RIFF container at EOF")
++        } else if let State::Data { remaining, .. } = self.state {
++            if remaining != 0 && remaining != u64::MAX {
++                Some("truncated WAV data at EOF")
++            } else if remaining == u64::MAX && !self.buf.is_empty() {
++                Some("incomplete WAV sample frame at EOF")
++            } else {
++                None
++            }
++        } else {
++            None
++        };
++        if let Some(reason) = reason {
++            bridge_diag_log(log::Level::Warn, &format!("reference-bridge: {reason}"));
++            false
++        } else {
++            true
+         }
+     }
+ 
+@@ -221,6 +273,7 @@
+ 
+         // The bridge is byte-stream oriented; both Raw and any extracted payload
+         // are simply appended. (The orender file-decode path always uses Raw.)
++        self.input_bytes = self.input_bytes.saturating_add(data.len() as u64);
+         self.buf.extend_from_slice(data.as_slice());
+ 
+         if matches!(self.state, State::Header) && !self.try_parse_header(&mut result) {
+@@ -243,12 +296,21 @@
+         false
+     }
+ 
+-    fn configure(&mut self, key: RStr<'_>, _value: RStr<'_>) -> bool {
++    fn configure(&mut self, key: RStr<'_>, value: RStr<'_>) -> bool {
+         // A WAV file exposes a single presentation, so the host's mandatory
+         // `presentation` selection is accepted (and ignored) — returning false
+         // here makes the CLI abort with "Bridge rejected presentation value".
+-        // All other keys are unrecognised.
+-        key.as_str() == "presentation"
++        // These optional keys use the existing ABI. Old hosts/bridges retain
++        // permissive streaming behavior unless finite validation is negotiated.
++        match key.as_str() {
++            "presentation" => true,
++            "finite-input-validation" if value.as_str() == "true" => {
++                self.finite_validation = true;
++                true
++            }
++            "finite-input-eof" if self.finite_validation => self.finish_finite_input(),
++            _ => false,
++        }
+     }
+ 
+     fn coordinate_format(&self) -> RCoordinateFormat {
+--- a/omniphony-renderer/src/cli/decode/decoder_thread.rs
++++ b/omniphony-renderer/src/cli/decode/decoder_thread.rs
+@@ -112,6 +112,10 @@
+             shutdown_signal,
+         } = config;
+ 
++        // Optional format validation uses existing configuration calls, not a
++        // new bridge ABI. Continuous resets and unmodified bridges are unchanged.
++        let validate_finite = !continuous
++            && bridge.configure("finite-input-validation".into(), "true".into());
+         let mut frame_count: u64 = 0;
+         // Labels the bridge's declared poses were last read for.
+         let mut declared_labels: Vec<RChannelLabel> = Vec::new();
+@@ -175,12 +179,14 @@
+             let mut session_throughput_audio_ms: f64 = 0.0;
+             let mut session_throughput_chunks: u64 = 0;
+ 
++            let mut stopped_early = false;
+             let mut process_chunk = |chunk: &[u8]| -> Result<bool> {
+                 // Secondary check: interrupt the current stream on shutdown or reload.
+                 if sys::ShutdownHandle::is_requested()
+                     || sys::ShutdownHandle::is_reload_requested()
+                     || sys::ShutdownHandle::is_restart_from_config_requested()
+                 {
++                    stopped_early = true;
+                     return Ok(false);
+                 }
+ 
+@@ -249,6 +255,11 @@
+                     let decode_started_at = Instant::now();
+                     let result =
+                         bridge.push_packet(payload.as_slice().into(), transport, data_type);
++                    if validate_finite && !result.error_message.is_empty() {
++                        return Err(anyhow::anyhow!(
++                            "Format bridge rejected finite input: {}", result.error_message
++                        ));
++                    }
+                     let decode_time_ms = decode_started_at.elapsed().as_secs_f32() * 1000.0;
+                     let payload_len = payload.len();
+                     let emitted_frames = result.frames.len();
+@@ -379,6 +390,7 @@
+                             })))
+                             .is_err()
+                         {
++                            stopped_early = true;
+                             return Ok(false);
+                         }
+                         let send_block_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+@@ -501,6 +513,16 @@
+                 &mut process_chunk,
+             )?;
+ 
++            if validate_finite
++                && !stopped_early
++                && !sys::ShutdownHandle::is_requested()
++                && !sys::ShutdownHandle::is_reload_requested()
++                && !sys::ShutdownHandle::is_restart_from_config_requested()
++                && !bridge.configure("finite-input-eof".into(), "".into())
++            {
++                return Err(anyhow::anyhow!("Invalid or truncated finite input at EOF"));
++            }
++
+             log::info!("Processing complete: {frame_count} frames");
+ 
+             if !continuous {
